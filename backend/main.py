@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from services.auth_service import AuthService
-from services.ms_graph import MSGraphService
+from services.file_processor import EmailFileProcessor
 from services.email_service import EmailService
+from services.llm_analyzer import LLMAnalyzer, EmailAnalysis
 from database import SessionLocal, engine
 import models
 import uvicorn
@@ -11,6 +11,8 @@ from typing import List, Dict
 import schemas
 from services.text_extraction import TextExtractionService
 import traceback
+import os
+from config import settings
 
 # Create database tables
 models.Base.metadata.create_all(bind=engine)
@@ -20,17 +22,13 @@ app = FastAPI()
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize services
-auth_service = AuthService()
-ms_graph_service = MSGraphService()
-
-# Dependency to get database session
+# Dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -40,161 +38,175 @@ def get_db():
 
 @app.get("/")
 def read_root():
-    return {"status": "running"}
+    return {"status": "ok"}
 
-@app.get("/auth/microsoft")
-async def get_auth_url(request: Request):
-    """Get Microsoft OAuth authorization URL"""
-    try:
-        print(f"Generating auth URL. Client IP: {request.client.host}")
-        return auth_service.get_auth_url()
-    except Exception as e:
-        print(f"Error in get_auth_url: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/auth/microsoft/callback")
-async def auth_callback(
-    request: Request,
-    code: str,
-    code_verifier: str,
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """Handle Microsoft OAuth callback"""
-    try:
-        print(f"Received callback. Client IP: {request.client.host}")
-        print(f"Code length: {len(code)}, Code verifier length: {len(code_verifier)}")
-        
-        # Get token from auth code
-        token_data = auth_service.get_token(code, code_verifier)
-        if not token_data:
-            raise HTTPException(status_code=400, detail="Failed to get token")
-            
-        # Get user info using the access token
-        print("Getting user info with access token")
-        user_info = ms_graph_service.get_user_info(token_data["access_token"])
-        
-        # Create or update user in database
-        print(f"Saving user info for: {user_info.get('mail')}")
-        user = models.User(
-            email=user_info["mail"],
-            name=user_info["displayName"],
-            access_token=token_data["access_token"],
-            refresh_token=token_data["refresh_token"]
+    """Upload and process PST or MBOX file"""
+    # Validate file type
+    if not file.filename.lower().endswith(('.pst', '.mbox')):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .pst and .mbox files are supported"
         )
-        db.add(user)
-        db.commit()
+    
+    # Save uploaded file
+    file_path = os.path.join(settings.UPLOAD_FOLDER, file.filename)
+    try:
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
         
-        return {"message": "Authentication successful", "user": user_info}
+        # Process the file
+        processor = EmailFileProcessor(db)
+        if file.filename.lower().endswith('.pst'):
+            stats = processor.process_pst_file(file_path)
+        else:
+            stats = processor.process_mbox_file(file_path)
+        
+        # Cleanup
+        processor.cleanup_upload(file_path)
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "stats": stats
+        }
+        
     except Exception as e:
-        print(f"Error in auth_callback: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Cleanup on error
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process file: {str(e)}"
+        )
 
-@app.get("/user")
-async def get_user_info(request: Request, token: str):
-    """Get user info from Microsoft Graph API"""
-    try:
-        print(f"Getting user info. Client IP: {request.client.host}")
-        return ms_graph_service.get_user_info(token)
-    except Exception as e:
-        print(f"Error in get_user_info: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/mailboxes/", response_model=schemas.Mailbox)
-def create_mailbox(mailbox: schemas.MailboxCreate, db: Session = Depends(get_db)):
-    """Add a new mailbox for email ingestion"""
-    try:
-        db_mailbox = models.Mailbox(**mailbox.dict())
-        db.add(db_mailbox)
-        db.commit()
-        db.refresh(db_mailbox)
-        return db_mailbox
-    except Exception as e:
-        print(f"Error in create_mailbox: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/mailboxes/", response_model=List[schemas.Mailbox])
+@app.get("/mailboxes")
 def list_mailboxes(db: Session = Depends(get_db)):
-    """List all connected mailboxes"""
-    try:
-        return db.query(models.Mailbox).all()
-    except Exception as e:
-        print(f"Error in list_mailboxes: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/mailboxes/{mailbox_id}/ingest")
-def start_ingestion(mailbox_id: int, db: Session = Depends(get_db)):
-    """Start email ingestion for a mailbox"""
-    try:
-        mailbox = db.query(models.Mailbox).filter(models.Mailbox.id == mailbox_id).first()
-        if not mailbox:
-            raise HTTPException(status_code=404, detail="Mailbox not found")
-        
-        # Initialize services
-        graph_service = MSGraphService(access_token=mailbox.access_token)
-        email_service = EmailService(db=db, graph_service=graph_service)
-        
-        # Process messages
-        result = email_service.process_messages(mailbox_id)
-        return {"status": "success", "details": result}
-    except Exception as e:
-        print(f"Error in start_ingestion: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """List all processed mailboxes"""
+    mailboxes = db.query(models.Mailbox).all()
+    return mailboxes
 
 @app.post("/process-attachments")
 def process_attachments(db: Session = Depends(get_db)):
     """Process all unprocessed attachments and extract text"""
+    text_service = TextExtractionService()
     try:
-        extraction_service = TextExtractionService(db)
-        results = extraction_service.process_unextracted_attachments()
-        return {
-            "status": "success",
-            "processed": results["success"],
-            "failed": results["failed"],
-            "total": results["total"]
-        }
+        attachments = db.query(models.Attachment).filter(
+            models.Attachment.processed == False
+        ).all()
+        
+        for attachment in attachments:
+            try:
+                extracted_text = text_service.extract_text(attachment.storage_path)
+                attachment.extracted_text = extracted_text
+                attachment.processed = True
+                db.add(attachment)
+            except Exception as e:
+                print(f"Failed to process attachment {attachment.id}: {str(e)}")
+        
+        db.commit()
+        return {"status": "success", "processed": len(attachments)}
+        
     except Exception as e:
-        print(f"Error in process_attachments: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/process-attachment/{attachment_id}")
-def process_single_attachment(attachment_id: int, db: Session = Depends(get_db)):
-    """Process a single attachment and extract its text"""
-    try:
-        extraction_service = TextExtractionService(db)
-        success = extraction_service.process_attachment(attachment_id)
-        if success:
-            return {"status": "success", "message": "Text extracted successfully"}
-        else:
-            return {"status": "failed", "message": "Failed to extract text"}
-    except Exception as e:
-        print(f"Error in process_single_attachment: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process attachments: {str(e)}"
+        )
 
 @app.get("/organizations")
 def get_organizations(db: Session = Depends(get_db)):
-    try:
-        return {"message": "Will return organizations"}
-    except Exception as e:
-        print(f"Error in get_organizations: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get list of organizations from email domains"""
+    return db.query(models.Organization).all()
 
 @app.get("/contacts")
 def get_contacts(db: Session = Depends(get_db)):
+    """Get list of contacts from emails"""
+    return db.query(models.Contact).all()
+
+llm_analyzer = LLMAnalyzer()
+
+@app.get("/emails/{email_id}/analysis")
+async def analyze_email(email_id: int, db: Session = Depends(get_db)) -> EmailAnalysis:
+    """
+    Analyze a single email using LLM to extract insights.
+    """
+    email = db.query(models.Email).filter(models.Email.id == email_id).first()
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    # Get sender and recipients
+    sender = db.query(models.Contact).filter(models.Contact.id == email.sender_id).first()
+    recipients = []  # You'll need to implement recipient tracking in your models
+
+    analysis = await llm_analyzer.analyze_email(
+        subject=email.subject,
+        body=email.body,
+        sender=sender.email if sender else "",
+        recipients=recipients
+    )
+    return analysis
+
+@app.get("/threads/{thread_id}/analysis")
+async def analyze_thread(thread_id: str, db: Session = Depends(get_db)):
+    """
+    Analyze an email thread using LLM.
+    """
+    # You'll need to implement thread tracking in your models
+    emails = db.query(models.Email).filter(models.Email.thread_id == thread_id).all()
+    if not emails:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    thread_emails = []
+    for email in emails:
+        sender = db.query(models.Contact).filter(models.Contact.id == email.sender_id).first()
+        thread_emails.append({
+            "sender": sender.email if sender else "",
+            "timestamp": email.received_date,
+            "subject": email.subject,
+            "body": email.body
+        })
+
+    analysis = await llm_analyzer.analyze_thread(thread_emails)
+    return analysis
+
+@app.get("/attachments/{attachment_id}/analysis")
+async def analyze_attachment(attachment_id: int, db: Session = Depends(get_db)):
+    """
+    Analyze an email attachment using LLM.
+    """
+    attachment = db.query(models.Attachment).filter(models.Attachment.id == attachment_id).first()
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    # Read attachment content
+    file_path = os.path.join(settings.ATTACHMENT_STORAGE_PATH, attachment.file_path)
     try:
-        return {"message": "Will return contacts"}
+        with open(file_path, 'r') as f:
+            content = f.read()
     except Exception as e:
-        print(f"Error in get_contacts: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Could not read attachment: {str(e)}")
+
+    analysis = await llm_analyzer.analyze_attachment_content(content, attachment.filename)
+    return analysis
+
+@app.get("/emails/search")
+async def semantic_search(
+    query: str,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    """
+    Perform semantic search across emails using LLM embeddings.
+    """
+    # This would be implemented using embeddings for better performance
+    # For now, we'll use the LLM to analyze the query and find relevant emails
+    raise HTTPException(status_code=501, detail="Semantic search not yet implemented")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

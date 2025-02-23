@@ -19,6 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+venv/
 
 # Node
 node_modules/
@@ -34,6 +35,7 @@ yarn-error.log*
 
 # Environment variables
 .env
+.env.*
 
 # IDE
 .vscode/
@@ -44,3 +46,10 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Application specific
+*.db
+data/
+backend/data/
+backend/attachments/
+backend/uploads/

@@ -1,6 +1,8 @@
 'use client'
 
 import { motion } from 'framer-motion'
+import { useState, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 
 const features = [
   {
@@ -23,7 +25,7 @@ const features = [
   },
   {
     title: 'Simple',
-    description: 'Connect and analyze in minutes',
+    description: 'Upload and analyze in minutes',
     icon: (
       <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
@@ -33,37 +35,55 @@ const features = [
 ]
 
 export default function Home() {
-  const handleConnect = async () => {
-    try {
-      const response = await fetch('http://localhost:8000/auth/microsoft', {
-        method: 'GET',
-        headers: {
-          'Accept': 'application/json',
-        },
-      });
-      
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      console.log('Auth URL response:', data);
+  const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [error, setError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const router = useRouter()
 
-      // Store code verifier in session storage
-      if (data.code_verifier) {
-        sessionStorage.setItem('code_verifier', data.code_verifier);
-      }
-      
-      // Redirect to Microsoft login
-      if (data.auth_url) {
-        window.location.href = data.auth_url;
-      } else {
-        throw new Error('No auth_url in response');
-      }
-    } catch (error) {
-      console.error('Failed to get auth URL:', error);
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    // Validate file type
+    if (!file.name.toLowerCase().endsWith('.pst') && !file.name.toLowerCase().endsWith('.mbox')) {
+      setError('Please upload a .pst or .mbox file')
+      return
     }
-  };
+
+    setUploading(true)
+    setError(null)
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const response = await fetch('http://localhost:8000/upload', {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.statusText}`)
+      }
+
+      const data = await response.json()
+      console.log('Upload response:', data)
+
+      // Redirect to dashboard on success
+      router.push('/dashboard')
+    } catch (error) {
+      console.error('Upload error:', error)
+      setError('Failed to upload file. Please try again.')
+    } finally {
+      setUploading(false)
+      setUploadProgress(0)
+    }
+  }
+
+  const handleUploadClick = () => {
+    fileInputRef.current?.click()
+  }
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center p-6">
@@ -96,16 +116,51 @@ export default function Home() {
           </p>
         </div>
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".pst,.mbox"
+          onChange={handleFileUpload}
+          className="hidden"
+        />
+
         <motion.button
-          onClick={handleConnect}
+          onClick={handleUploadClick}
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
-          className="group relative w-full px-8 py-4 overflow-hidden rounded-lg font-medium tracking-wide text-white"
+          disabled={uploading}
+          className="group relative w-full px-8 py-4 overflow-hidden rounded-lg font-medium tracking-wide text-white disabled:opacity-50"
         >
           <div className="absolute inset-0 bg-gradient-to-r from-blue-500 to-violet-500" />
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-white/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-          <span className="relative">Connect Outlook</span>
+          <span className="relative">
+            {uploading ? 'Uploading...' : 'Upload Email File'}
+          </span>
         </motion.button>
+
+        {error && (
+          <motion.p
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="text-red-400 text-sm"
+          >
+            {error}
+          </motion.p>
+        )}
+
+        {uploading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="w-full bg-white/10 rounded-full h-2 overflow-hidden"
+          >
+            <motion.div
+              initial={{ width: 0 }}
+              animate={{ width: `${uploadProgress}%` }}
+              className="h-full bg-gradient-to-r from-blue-500 to-violet-500"
+            />
+          </motion.div>
+        )}
 
         <div className="grid grid-cols-1 gap-6 pt-12">
           {features.map((feature, i) => (
